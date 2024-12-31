@@ -1,0 +1,361 @@
+/******************/
+/*          KONFIGURASI BLYNK & LIBRARY            */
+/******************/
+
+// Mendefinisikan Template ID, Name, dan Auth Token untuk Blynk (Blynk IoT)
+#define BLYNK_TEMPLATE_ID "TMPL6sf76PkHt"
+#define BLYNK_TEMPLATE_NAME "Hidroponik"
+#define BLYNK_AUTH_TOKEN   "l_GCxTPW2olqH_ZWGuoR69we1jEV_mBF"
+
+// Meng-include library standar Arduino
+#include <Arduino.h>
+
+// Library I2C + LCD
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Library DHT untuk sensor kelembapan & suhu
+#include <DHT.h>
+
+// Library WiFi (untuk ESP32)
+#include <WiFi.h>
+
+// Library Blynk untuk ESP32
+#include <BlynkSimpleEsp32.h>
+
+/******************/
+/*     INISIALISASI OBJEK & PIN                    */
+/******************/
+
+// Membuat objek LCD 16 kolom x 2 baris di alamat 0x27
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Pin untuk sensor DHT11
+const int pinDHT11 = 15;   
+// Membuat objek DHT (tipe DHT11) pada pinDHT11
+DHT dht11(pinDHT11, DHT11);
+
+// Definisi pin
+const int Relay   = 5;     // Relay (untuk pompa)
+const int Trig    = 12;    // Ultrasonic Trig
+const int Echo    = 13;    // Ultrasonic Echo
+const int Button  = 14;    // Tombol fisik (mode push-button, pull-up)
+const int LDR     = 34;    // Sensor LDR
+
+// Variabel untuk tombol fisik
+int lastState    = HIGH;   // Menyimpan status tombol sebelumnya
+int currentState = HIGH;   // Menyimpan status tombol saat ini
+
+// Variabel LDR
+int   ldrValue      = 0;   // Nilai analog mentah dari sensor LDR
+int   normalizedLDR = 0;   // Nilai hasil pemetaan (0-100) dari ldrValue
+
+// Variabel jarak & DHT
+int   distance   = 0;      // Menyimpan hasil baca jarak (cm)
+float humi       = 0;      // Menyimpan kelembapan dari DHT11
+float tempC      = 0;      // Menyimpan suhu Celcius
+float tempF      = 0;      // Menyimpan suhu Fahrenheit
+
+// Informasi WiFi & Blynk
+char auth[] = "l_GCxTPW2olqH_ZWGuoR69we1jEV_mBF";  
+char ssid[] = "rin";      // Ganti dengan nama Wi-Fi Anda
+char pass[] = "scaramouche";   // Ganti dengan password Wi-Fi Anda
+
+// Objek timer Blynk
+BlynkTimer timer;
+
+/******************/
+/*    VARIABEL UNTUK MODE OTOMATIS / MANUAL         */
+/******************/
+// true  = auto mode (logika otomatis berdasar jarak)
+// false = manual mode (relay dikontrol manual oleh Blynk / tombol fisik)
+bool autoMode = true;  
+
+/******************/
+/*    VIRTUAL PIN UNTUK LDR                         */
+/******************/
+// Kita akan menggunakan:
+// V7 -> alarm biner (1 = Kurang Cahaya, 0 = Cukup)
+// V8 -> teks kondisi cahaya ("Kurang Cahaya" / "Cahaya Cukup")
+
+/******************/
+/*  BLYNK WRITE UNTUK MENGATUR MODE (V5)            */
+/******************/
+// Tombol (Switch) di Blynk pada Virtual Pin V5
+//  - ON  => autoMode = true (otomatis)
+//  - OFF => autoMode = false (manual)
+BLYNK_WRITE(V5)
+{
+  int pinValue = param.asInt(); // Membaca nilai (1=ON, 0=OFF)
+
+  if (pinValue == 1) {
+    // Mengaktifkan mode otomatis
+    autoMode = true;
+    Serial.println("Mode: AUTO");
+    // Tampilkan di LCD baris ke-0
+    lcd.setCursor(0, 0);
+    lcd.print("Mode: AUTO     ");
+  } else {
+    // Mengaktifkan mode manual
+    autoMode = false;
+    Serial.println("Mode: MANUAL");
+    // Tampilkan di LCD baris ke-0
+    lcd.setCursor(0, 0);
+    lcd.print("Mode: MANUAL   ");
+  }
+}
+
+/******************/
+/* BLYNK WRITE UNTUK KONTROL RELAY MANUAL (V6)      */
+/******************/
+// Tombol (Switch) di Blynk pada Virtual Pin V6
+//  - ON  => Relay ON (jika autoMode=false)
+//  - OFF => Relay OFF (jika autoMode=false)
+BLYNK_WRITE(V6)
+{
+  int pinValue = param.asInt(); // 1=ON, 0=OFF
+
+  // Perintah manual hanya valid jika autoMode=false
+  if (!autoMode) {
+    if (pinValue == 1) {
+      // Nyalakan relay
+      digitalWrite(Relay, HIGH);
+      Serial.println("Relay ON (Manual / Blynk)");
+      // Tampilkan di LCD baris ke-0
+      lcd.setCursor(0, 0);
+      lcd.print("Pompa nyala    ");
+    } else {
+      // Matikan relay
+      digitalWrite(Relay, LOW);
+      Serial.println("Relay OFF (Manual / Blynk)");
+      // Tampilkan di LCD baris ke-0
+      lcd.setCursor(0, 0);
+      lcd.print("Pompa mati     ");
+    }
+  } else {
+    // Jika sedang Auto Mode, abaikan perintah di V6
+    Serial.println("Tombol V6 ditekan, tapi autoMode=true. Diabaikan.");
+  }
+}
+
+/******************/
+/*           FUNGSI-FUNGSI UNTUK SENSOR            */
+/******************/
+
+// 1. Inisialisasi perangkat (pin, LCD, DHT, dll)
+void initPeripherals() {
+  pinMode(Relay, OUTPUT);       // Relay sebagai output
+  pinMode(Trig, OUTPUT);        // Trig ultrasonic
+  pinMode(Echo, INPUT);         // Echo ultrasonic
+  pinMode(Button, INPUT_PULLUP);// Tombol fisik, pull-up internal
+  pinMode(LDR, INPUT);          // LDR (input analog)
+
+  // Pastikan relay mati diawal
+  digitalWrite(Relay, LOW);
+
+  // Mulai sensor DHT
+  dht11.begin();
+
+  // Inisialisasi LCD
+  lcd.init();
+  lcd.backlight();
+
+  // Tampilkan pesan awal di LCD
+  lcd.setCursor(0, 0);
+  lcd.print("Relay: OFF");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(1000);
+}
+
+// 2. Baca sensor DHT11 (suhu & kelembapan)
+void readDHT11() {
+  humi  = dht11.readHumidity();    // Baca kelembapan
+  tempC = dht11.readTemperature(); // Baca suhu Celcius
+
+  // Periksa apakah hasil valid
+  if (isnan(humi) || isnan(tempC)) {
+    Serial.println("Gagal membaca sensor DHT11!");
+    return;
+  }
+  // Konversi ke Fahrenheit
+  tempF = (tempC * 9.0 / 5.0) + 32;
+}
+
+// 3. Baca sensor Ultrasonik (jarak)
+void readUltrasonic() {
+  // Trigger low selama 2 microseconds
+  digitalWrite(Trig, LOW);
+  delayMicroseconds(2);
+  
+  // Trigger high selama 10 microseconds
+  digitalWrite(Trig, HIGH);
+  delayMicroseconds(10);
+  
+  // Kembalikan Trigger ke LOW
+  digitalWrite(Trig, LOW);
+
+  // Baca waktu pantulan (Echo)
+  // pulseIn(Echo, HIGH, 1000000) => timeout 1 detik
+  long duration = pulseIn(Echo, HIGH, 1000000); 
+  // Konversi durasi ke jarak (cm)
+  distance = duration * 0.034 / 2;
+}
+
+// 4. Baca sensor LDR
+void readLDR() {
+  // Baca nilai analog LDR
+  ldrValue = analogRead(LDR);
+
+  // Pemetaan: dari range (250..4095) ke (0..100)
+  // (Silakan ubah jika diperlukan menyesuaikan kondisi LDR)
+  normalizedLDR = map(ldrValue, 250, 4095, 0, 100);
+}
+
+// 5. Kirim data sensor ke Blynk
+void sendDataToBlynk() {
+  // Kirim data kelembapan (V0), suhu Celcius (V1), suhu Fahrenheit (V2)
+  Blynk.virtualWrite(V0, humi);
+  Blynk.virtualWrite(V1, tempC);
+  Blynk.virtualWrite(V2, tempF);
+
+  // Kirim data jarak (V3)
+  Blynk.virtualWrite(V3, distance);
+
+  // Alarm biner cahaya -> V7
+  // 1 = Kurang Cahaya, 0 = Cahaya Cukup
+  // Teks kondisi cahaya -> V8
+  if (normalizedLDR > 50) {
+    // Kurang Cahaya
+    Blynk.virtualWrite(V7, 1);                // Tulis "1" ke V7
+    Blynk.virtualWrite(V8, "Kurang Cahaya");  // Teks ke V8
+  } else {
+    // Cahaya Cukup
+    Blynk.virtualWrite(V7, 0);               // Tulis "0" ke V7
+    Blynk.virtualWrite(V8, "Cahaya Cukup");  // Teks ke V8
+  }
+
+  Serial.println("Data sensor dikirim ke Blynk!");
+}
+
+// 6. Update tampilan di LCD (baris ke-2)
+void updateLCD() {
+  // Tampilkan kondisi cahaya berdasarkan normalizedLDR
+  if (normalizedLDR > 50) {
+    // Kurang Cahaya
+    lcd.setCursor(0, 1);
+    lcd.print("Kurang Cahaya  ");
+  } else {
+    // Cahaya Cukup
+    lcd.setCursor(0, 1);
+    lcd.print("Cahaya Cukup   ");
+  }
+
+  // Contoh: jika suhu > 30 derajat, tampilkan "Suhu Tinggi!"
+  if (!isnan(tempC) && tempC > 30) {
+    lcd.setCursor(0, 1);
+    lcd.print("Suhu Tinggi!   ");
+  }
+}
+
+// 7. Handle tombol fisik (toggle), hanya berfungsi jika mode manual
+void handleButton() {
+  // Baca status tombol
+  currentState = digitalRead(Button);
+
+  // Cek transisi dari HIGH ke LOW (tombol ditekan)
+  if (lastState == HIGH && currentState == LOW) {
+    // Jika sedang mode manual, toggle relay
+    if (!autoMode) {
+      bool newRelayState = !digitalRead(Relay);
+      digitalWrite(Relay, newRelayState);
+
+      lcd.setCursor(0, 0);
+      if (newRelayState) {
+        lcd.print("Relay: ON     ");
+        Serial.println("Relay ON (Tombol fisik, Manual)");
+      } else {
+        lcd.print("Relay: OFF    ");
+        Serial.println("Relay OFF (Tombol fisik, Manual)");
+      }
+    } else {
+      // Jika sedang autoMode=true, abaikan tombol
+      Serial.println("Tombol fisik ditekan, tapi autoMode=true => diabaikan.");
+    }
+  }
+
+  // Simpan status tombol sebagai status sebelumnya
+  lastState = currentState;
+}
+
+// 8. Logika otomatis berdasarkan jarak (autoMode)
+void autoControlRelayByDistance() {
+  // Jika jarak > 3 cm, nyalakan relay
+  if (distance > 3) {
+    digitalWrite(Relay, HIGH);
+    lcd.setCursor(0, 0);
+    lcd.print("Pompa nyala    ");
+  } else {
+    // Kalau <= 3 cm, matikan relay
+    digitalWrite(Relay, LOW);
+    lcd.setCursor(0, 0);
+    lcd.print("Pompa mati     ");
+  }
+}
+
+// 9. Fungsi Timer Blynk (dipanggil setiap 2 detik)
+void sensorTask() {
+  // Baca semua sensor
+  readDHT11();
+  readUltrasonic();
+  readLDR();
+
+  // Kirim data ke Blynk
+  sendDataToBlynk();
+}
+
+/******************/
+/*                    SETUP                         */
+/******************/
+void setup() {
+  // Mulai Serial Monitor
+  Serial.begin(9600);
+
+  // Hubungkan ke WiFi
+  WiFi.begin(ssid, pass);
+  
+  // Hubungkan ke Blynk server
+  Blynk.begin(auth, ssid, pass);
+
+  // Inisialisasi pin & LCD
+  initPeripherals();
+
+  // Buat timer Blynk, panggil sensorTask() tiap 2 detik (2000 ms)
+  timer.setInterval(2000L, sensorTask);
+}
+
+/******************/
+/*                      LOOP                        */
+/******************/
+void loop() {
+  // Jalankan Blynk
+  Blynk.run();
+  
+  // Jalankan timer Blynk
+  timer.run();
+
+  // Baca tombol fisik
+  handleButton();
+
+  // Jika autoMode=true, jalankan logika otomatis (berdasar jarak)
+  if (autoMode) {
+    autoControlRelayByDistance();
+  }
+  // Jika autoMode=false => relay dikontrol manual oleh Blynk / tombol fisik
+
+  // Update tampilan LCD untuk baris ke-2
+  updateLCD();
+
+  // Beri sedikit jeda
+  delay(200);
+}
